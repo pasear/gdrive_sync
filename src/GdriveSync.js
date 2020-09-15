@@ -2,13 +2,27 @@ const fs = require('fs');
 const config = require('config');
 const path = require('path');
 const { google } = require('googleapis');
+const BigNumber = require('bignumber.js');
 const log = require('./utils/log4js').getLogger('GdriveSync');
 
 const FOLDER_TYPE = config.get('consts.FOLDER_TYPE');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function doRetransmit(func) {
+BigNumber.config({
+  FORMAT: {
+    prefix: '',
+    decimalSeparator: '.',
+    groupSeparator: ',',
+    groupSize: 3,
+    secondaryGroupSize: 0,
+    fractionGroupSeparator: ' ',
+    fractionGroupSize: 0,
+    suffix: ''
+  }
+});
+
+function doRetransmit(func, pre_retry) {
   return new Promise((resolve, reject) => {
     let count_500 = 0;
     function f() {
@@ -17,13 +31,10 @@ function doRetransmit(func) {
         if (status < 300) resolve(data);
         else {
           log.debug('doRetransmit', status, statusText);
-          if (status >= 300 && status < 400) {
-            setTimeout(f, config.schedule.retransmit_interval);
-          } if (status === 429) {
-            setTimeout(f, config.schedule.retransmit_interval);
-          } else if (status >= 500 && count_500 < 10) {
-            count_500 += 1;
-            setTimeout(f, config.schedule.retransmit_interval);
+          if ((status >= 300 && status < 400) || (status === 429) || (status >= 500 && count_500 < 10)) {
+            if (status >= 500) count_500 += 1;
+            if (pre_retry) pre_retry().then(() => setTimeout(f, config.schedule.retransmit_interval)).catch((e) => reject(e));
+            else setTimeout(f, config.schedule.retransmit_interval);
           } else throw new Error(statusText);
         }
       })
@@ -40,6 +51,7 @@ class GdriveSync {
     this.drive = google.drive({ version: 'v3', auth });
     this.app_config = app_config;
     this.sync_state = sync_state;
+    this.cumulated_bytes = new BigNumber(0);
   }
 
   async getById(fileId) {
@@ -90,8 +102,20 @@ class GdriveSync {
         media,
         fields: 'id, name, mimeType, size',
         enforceSingleParent: true
-      }));
+      }), async () => {
+        const query = {
+          fields: 'files(id, name, mimeType, size)',
+          spaces: 'drive',
+          q: `'${remote_parent.id}' in parents and trashed = false and name = '${name}'`
+        };
+        const ret = await doRetransmit(this.drive.files.list(query));
+        if (ret && Array.isArray(ret.files)) {
+          await Promise.all(ret.files.map((f) => this.rm(f)));
+        }
+      });
       this.sync_state.setSuccess(local_path, data);
+      this.cumulated_bytes = this.cumulated_bytes.plus(data.size);
+      this.display_progress();
       // log.debug('upload file response', data);
       return data;
     } catch (err) {
@@ -131,6 +155,13 @@ class GdriveSync {
     }
   }
 
+  display_progress() {
+    if (this.cumulated_bytes.minus(this.old_bytes).gt(this.level)) {
+      this.old_bytes = this.cumulated_bytes;
+      log.info('completed bytes:', this.cumulated_bytes.toFormat());
+    }
+  }
+
   async* dfs(local_folder, remote_folder) {
     log.info('>', local_folder);
     // copy contents in local_folder to remote_folder
@@ -167,6 +198,8 @@ class GdriveSync {
           }
         } else {
           const stats = await fs.promises.stat(fp);
+          this.cumulated_bytes = this.cumulated_bytes.plus(stats.size);
+          this.display_progress();
           if (parseInt(f.size) === stats.size) {
             // log.debug('ignore duplicate', fp);
             continue;
@@ -200,6 +233,9 @@ class GdriveSync {
 
     let running = 0;
     const max_concurrency = config.get('consts.max_concurrency');
+    this.cumulated_bytes = new BigNumber(0);
+    this.old_bytes = new BigNumber(0);
+    this.level = new BigNumber(1 << 20);
     for await (const task of this.dfs(local_root, remote_root)) {
       while (running >= max_concurrency) await sleep(1000);
       (async () => {

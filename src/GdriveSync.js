@@ -16,6 +16,7 @@ function doRetransmit(func) {
       .then(({ data, status, statusText }) => {
         if (status < 300) resolve(data);
         else {
+          log.debug('doRetransmit', status, statusText);
           if (status >= 300 && status < 400) {
             setTimeout(f, config.schedule.retransmit_interval);
           } if (status === 429) {
@@ -49,14 +50,17 @@ class GdriveSync {
 
   async listFiles(remote_parent) {
     const fileMap = new Map();
+    const q = `'${remote_parent.id}' in parents and trashed = false`;
+    const query = {
+      fields: 'nextPageToken, files(id, name, mimeType, size, parents)',
+      spaces: 'drive',
+      q
+    };
     try {
       let pageToken = null;
       do {
-        const data = await doRetransmit(this.drive.files.list({
-          fields: 'nextPageToken, files(id, name, mimeType, size, parents)',
-          spaces: 'drive',
-          q: `'${remote_parent.id}' in parents and trashed = false`
-        }));
+        if (pageToken) query.pageToken = pageToken;
+        const data = await doRetransmit(this.drive.files.list(query));
         const { files, nextPageToken } = data;
         pageToken = nextPageToken;
         if (Array.isArray(files)) {
@@ -128,6 +132,7 @@ class GdriveSync {
   }
 
   async* dfs(local_folder, remote_folder) {
+    log.info('>', local_folder);
     // copy contents in local_folder to remote_folder
     const [contents] = await Promise.all([fs.promises.readdir(local_folder, { encoding: 'utf-8', withFileTypes: true })]);
     contents.sort((a, b) => {
@@ -163,7 +168,7 @@ class GdriveSync {
         } else {
           const stats = await fs.promises.stat(fp);
           if (parseInt(f.size) === stats.size) {
-            log.debug('ignore duplicate', fp);
+            // log.debug('ignore duplicate', fp);
             continue;
           } else {
             log.info(`${f.name} size mismatch: remote ${f.size}, local ${stats.size}. Deleting...`);

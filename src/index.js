@@ -1,9 +1,11 @@
 const fs = require('fs');
 const path = require('path');
+const config = require('config');
 const readline = require('readline');
-const yaml = require('yaml');
+const yaml = require('js-yaml');
 const { google } = require('googleapis');
 const GdriveSync = require('./GdriveSync');
+const SyncState = require('./SyncState');
 
 const SCOPES = ['https://www.googleapis.com/auth/drive'];
 const TOKEN_PATH = path.join(__dirname, '../token.json');
@@ -74,10 +76,18 @@ async function setup() {
  */
 
 async function main() {
-    const auth = await setup();
-    const gd = new GdriveSync(auth);
-    const app_cfg = fs.readFileSync(path.join(__dirname, '../app.yml'), { encoding: 'utf-8' });
-    await gd.doSync(yaml.parse(app_cfg));
+  const app_cfg = yaml.safeLoad(fs.readFileSync(path.join(__dirname, '../app.yml'), { encoding: 'utf-8' }));
+  const auth = await setup();
+  const sync_state = new SyncState({ path_prefix: app_cfg.localRootFolder || '' });
+  await sync_state.load();
+  const gd = new GdriveSync(auth, app_cfg, sync_state);
+  setInterval(() => sync_state.save(), config.schedule.sync_state_save * 1000 * 60);
+  try {
+    await gd.doSync();
+  } finally {
+    await sync_state.save();
+    process.exit(0);
+  }
 }
 
 main();
